@@ -2394,14 +2394,22 @@ textarea:focus {
         </section>
 
         <section class="settings-panel">
-          <h3>Social / X / grok2api</h3>
-          <p>推荐优先填写 grok2api 后台地址和 `app_key`。如果你有自己的 compatible 网关，也可以在这里手动覆写上游 key、客户端 token 和高级路径。</p>
+          <h3>Social / X 上游配置</h3>
+          <p>选择上游协议：xAI Responses API 或 OpenAI-compatible Chat Completions。Chat Completions 适合普通中转站。</p>
           <form onsubmit="saveSocialSettings(event)">
             <div class="settings-fields">
+              <div class="settings-field full-width">
+                <label for="settings-social-upstream-protocol">上游协议</label>
+                <select id="settings-social-upstream-protocol">
+                  <option value="responses">responses — xAI Responses API</option>
+                  <option value="chat_completions">chat_completions — OpenAI Chat Completions</option>
+                </select>
+                <div class="hint">Chat Completions 适合普通中转站；Responses 适合 xAI 原生 / grok2api。</div>
+              </div>
               <div class="settings-field">
                 <label for="settings-social-upstream-base-url">上游 Base URL</label>
-                <input type="text" id="settings-social-upstream-base-url" placeholder="https://media.example.com/v1">
-                <div class="hint">真正转发 `/responses` 时使用的上游地址。</div>
+                <input type="text" id="settings-social-upstream-base-url" placeholder="https://xiaomuai.cn/v1">
+                <div class="hint">上游 API 的基础地址。会拼上 Path 作为实际请求 URL。</div>
               </div>
               <div class="settings-field">
                 <label for="settings-social-model">模型</label>
@@ -2439,7 +2447,12 @@ textarea:focus {
               <summary>高级路径和缓存</summary>
               <div class="settings-fields">
                 <div class="settings-field">
-                  <label for="settings-social-upstream-responses-path">Responses Path</label>
+                  <label for="settings-social-upstream-path">上游 Path</label>
+                  <input type="text" id="settings-social-upstream-path" placeholder="/chat/completions">
+                  <div class="hint">请求路径。留空时根据协议自动选择：responses → /responses，chat_completions → /chat/completions。</div>
+                </div>
+                <div class="settings-field">
+                  <label for="settings-social-upstream-responses-path">Responses Path（兼容）</label>
                   <input type="text" id="settings-social-upstream-responses-path" placeholder="/responses">
                 </div>
                 <div class="settings-field">
@@ -3035,7 +3048,9 @@ function describeConfiguredSecret(masked, configured) {
 
 function fillSettingsForm(settings) {
   const social = settings?.social || {};
+  document.getElementById('settings-social-upstream-protocol').value = social.upstream_protocol || 'responses';
   document.getElementById('settings-social-upstream-base-url').value = social.upstream_base_url || '';
+  document.getElementById('settings-social-upstream-path').value = social.upstream_path || '';
   document.getElementById('settings-social-upstream-responses-path').value = social.upstream_responses_path || '/responses';
   document.getElementById('settings-social-admin-base-url').value = social.admin_base_url || '';
   document.getElementById('settings-social-admin-verify-path').value = social.admin_verify_path || '/v1/admin/verify';
@@ -3930,7 +3945,9 @@ async function changePwd(event) {
 async function saveSocialSettings(event) {
   event?.preventDefault?.();
   const body = {
+    upstream_protocol: document.getElementById('settings-social-upstream-protocol').value.trim(),
     upstream_base_url: document.getElementById('settings-social-upstream-base-url').value.trim(),
+    upstream_path: document.getElementById('settings-social-upstream-path').value.trim(),
     upstream_responses_path: document.getElementById('settings-social-upstream-responses-path').value.trim(),
     admin_base_url: document.getElementById('settings-social-admin-base-url').value.trim(),
     admin_verify_path: document.getElementById('settings-social-admin-verify-path').value.trim(),

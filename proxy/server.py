@@ -44,9 +44,17 @@ SOCIAL_GATEWAY_UPSTREAM_BASE_URL = os.environ.get(
     "SOCIAL_GATEWAY_UPSTREAM_BASE_URL",
     "https://api.x.ai/v1",
 ).rstrip("/")
+SOCIAL_GATEWAY_UPSTREAM_PROTOCOL = os.environ.get(
+    "SOCIAL_GATEWAY_UPSTREAM_PROTOCOL",
+    "responses",
+).strip().lower()
 SOCIAL_GATEWAY_UPSTREAM_RESPONSES_PATH = _normalize_path(
     os.environ.get("SOCIAL_GATEWAY_UPSTREAM_RESPONSES_PATH", "/responses"),
     "/responses",
+)
+SOCIAL_GATEWAY_UPSTREAM_CHAT_COMPLETIONS_PATH = _normalize_path(
+    os.environ.get("SOCIAL_GATEWAY_UPSTREAM_CHAT_COMPLETIONS_PATH", "/chat/completions"),
+    "/chat/completions",
 )
 SOCIAL_GATEWAY_UPSTREAM_API_KEY = os.environ.get("SOCIAL_GATEWAY_UPSTREAM_API_KEY", "").strip()
 SOCIAL_GATEWAY_MODEL = os.environ.get("SOCIAL_GATEWAY_MODEL", "grok-4.1-fast").strip()
@@ -212,8 +220,32 @@ def get_runtime_social_config():
     except (TypeError, ValueError):
         fallback_min_results = SOCIAL_GATEWAY_FALLBACK_MIN_RESULTS
 
+    upstream_protocol = get_setting_text(
+        "social_upstream_protocol",
+        SOCIAL_GATEWAY_UPSTREAM_PROTOCOL,
+    ) or SOCIAL_GATEWAY_UPSTREAM_PROTOCOL
+
+    upstream_path = get_setting_text(
+        "social_upstream_path",
+        "",
+    )
+    if not upstream_path:
+        if upstream_protocol == "chat_completions":
+            upstream_path = get_setting_text(
+                "social_upstream_responses_path",
+                SOCIAL_GATEWAY_UPSTREAM_CHAT_COMPLETIONS_PATH,
+            ) or SOCIAL_GATEWAY_UPSTREAM_CHAT_COMPLETIONS_PATH
+        else:
+            upstream_path = get_setting_text(
+                "social_upstream_responses_path",
+                SOCIAL_GATEWAY_UPSTREAM_RESPONSES_PATH,
+            ) or SOCIAL_GATEWAY_UPSTREAM_RESPONSES_PATH
+    upstream_path = _normalize_path(upstream_path, "/responses")
+
     return {
         "upstream_base_url": upstream_base_url,
+        "upstream_protocol": upstream_protocol,
+        "upstream_path": upstream_path,
         "upstream_responses_path": _normalize_path(
             get_setting_text(
                 "social_upstream_responses_path",
@@ -477,6 +509,8 @@ async def resolve_social_gateway_state(force=False):
         config = get_runtime_social_config()
         state = {
             "upstream_base_url": config["upstream_base_url"],
+            "upstream_protocol": config["upstream_protocol"],
+            "upstream_path": config["upstream_path"],
             "upstream_responses_path": config["upstream_responses_path"],
             "admin_base_url": config["admin_base_url"],
             "admin_verify_path": config["admin_verify_path"],
@@ -952,6 +986,8 @@ async def build_social_dashboard():
         "fallback_min_results": state["fallback_min_results"],
         "token_source": state["token_source"],
         "upstream_base_url": state["upstream_base_url"],
+        "upstream_protocol": state.get("upstream_protocol", "responses"),
+        "upstream_path": state.get("upstream_path", "/responses"),
         "upstream_responses_path": state["upstream_responses_path"],
         "admin_base_url": state["admin_base_url"],
         "admin_configured": state["admin_configured"],
@@ -972,7 +1008,9 @@ async def build_settings_payload():
     state = await resolve_social_gateway_state(force=False)
     return {
         "social": {
+            "upstream_protocol": config["upstream_protocol"],
             "upstream_base_url": config["upstream_base_url"],
+            "upstream_path": config["upstream_path"],
             "upstream_responses_path": config["upstream_responses_path"],
             "admin_base_url": config["admin_base_url"],
             "admin_verify_path": config["admin_verify_path"],
@@ -1074,6 +1112,14 @@ def forward_raw_response(resp):
 def extract_response_text(payload):
     if isinstance(payload.get("output_text"), str) and payload.get("output_text").strip():
         return payload["output_text"].strip()
+
+    # chat completions format: choices[0].message.content
+    choices = payload.get("choices")
+    if isinstance(choices, list) and len(choices) > 0:
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
 
     parts = []
     for item in payload.get("output", []) or []:
@@ -1338,7 +1384,7 @@ def build_social_result(citation=None, matched=None):
     }
 
 
-def build_social_search_upstream_payload(body, model):
+def build_social_responses_payload(body, model):
     query = (body.get("query") or "").strip()
     max_results = max(1, min(int(body.get("max_results") or 5), 10))
     tools = [{"type": "x_search"}]
@@ -1372,6 +1418,38 @@ def build_social_search_upstream_payload(body, model):
         "temperature": 0,
         "store": False,
     }
+
+
+def build_social_chat_completions_payload(body, model):
+    query = (body.get("query") or "").strip()
+    max_results = max(1, min(int(body.get("max_results") or 5), 10))
+
+    system_prompt = (
+        "You are a social media search engine. Search X (Twitter) for the user's query. "
+        "Return ONLY a valid JSON object (no markdown, no code fences) with this structure:\n"
+        '{"results":[{"title":"...","url":"...","text":"...","author":"...",'
+        '"handle":"...","created_at":"...","why_relevant":"..."}],"answer":"..."}\n'
+        "If no results found, return {\"results\":[],\"answer\":\"No results found.\"}\n"
+        "Use direct x.com status URLs when available. Use empty strings for unknown fields."
+    )
+
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Search X for: {query}. Return up to {max_results} results.",
+            },
+        ],
+        "stream": False,
+    }
+
+
+def build_social_search_upstream_payload(body, model, protocol="responses"):
+    if protocol == "chat_completions":
+        return build_social_chat_completions_payload(body, model)
+    return build_social_responses_payload(body, model)
 
 
 def count_social_results(payload):
@@ -1523,11 +1601,12 @@ def extract_social_upstream_error(upstream_body, fallback_detail="Social search 
 
 
 async def execute_social_search_attempt(query, body, state, model, max_results):
-    upstream_payload = build_social_search_upstream_payload(body, model)
+    protocol = state.get("upstream_protocol", "responses")
+    upstream_payload = build_social_search_upstream_payload(body, model, protocol)
     start = time.monotonic()
     try:
         response = await http_client.post(
-            f"{state['upstream_base_url']}{state['upstream_responses_path']}",
+            f"{state['upstream_base_url']}{state['upstream_path']}",
             json=upstream_payload,
             headers={"Authorization": f"Bearer {state['resolved_upstream_api_key']}"},
         )
@@ -1567,6 +1646,7 @@ async def execute_social_search_attempt(query, body, state, model, max_results):
         upstream_body,
         max_results,
         model=model,
+        protocol=protocol,
     )
     return build_social_attempt_summary(
         model,
@@ -1577,15 +1657,24 @@ async def execute_social_search_attempt(query, body, state, model, max_results):
     )
 
 
-def normalize_social_search_response(query, payload, max_results, *, model=None):
+def normalize_social_search_response(query, payload, max_results, *, model=None, protocol=None):
     text = extract_response_text(payload)
+    # strip <think>...</think> blocks (common with reasoning LLMs)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    # fix unescaped newlines inside JSON strings (model quality issue)
+    text = re.sub(r'(?<!\\)\n(?!\s*["\]\}])', ' ', text)
     structured = extract_json_object(text)
     parsed_results = structured.get("results") if isinstance(structured, dict) else []
     answer = (structured.get("answer") or "").strip() if isinstance(structured, dict) else ""
     if not answer:
         answer = text
 
-    trusted_citations = build_trusted_social_citations(payload)
+    # trusted_citations rely on xAI responses output; skip for chat_completions
+    if protocol == "chat_completions":
+        trusted_citations = []
+    else:
+        trusted_citations = build_trusted_social_citations(payload)
+
     trusted_map = {item["match_url"]: item for item in trusted_citations}
     matched_results = {}
     fallback_results = []
@@ -1769,6 +1858,8 @@ async def social_health():
         "ok": bool(state["resolved_upstream_api_key"] and state["accepted_tokens"]),
         "mode": state["mode"],
         "upstream_base_url": state["upstream_base_url"],
+        "upstream_protocol": state.get("upstream_protocol", "responses"),
+        "upstream_path": state.get("upstream_path", "/responses"),
         "upstream_responses_path": state["upstream_responses_path"],
         "admin_base_url": state["admin_base_url"],
         "model": state["model"],
@@ -1950,7 +2041,9 @@ async def update_social_settings(request: Request, _=Depends(verify_admin)):
         raise HTTPException(status_code=400, detail="Expected JSON request body")
 
     text_fields = {
+        "upstream_protocol": "social_upstream_protocol",
         "upstream_base_url": "social_upstream_base_url",
+        "upstream_path": "social_upstream_path",
         "upstream_responses_path": "social_upstream_responses_path",
         "admin_base_url": "social_admin_base_url",
         "admin_verify_path": "social_admin_verify_path",
